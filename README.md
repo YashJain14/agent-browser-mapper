@@ -123,8 +123,8 @@ agent-browser install  # Download Chrome from Chrome for Testing
 ### From Source
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/agent-browser
-cd agent-browser
+git clone https://github.com/YashJain14/agent-browser-mapper
+cd agent-browser-mapper
 pnpm install
 pnpm build
 pnpm build:native   # Requires Rust (https://rustup.rs)

@@ -39,11 +39,11 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/YOUR_USERNAME/agent-browser-mapper.git"
+    "url": "git+https://github.com/YashJain14/agent-browser-mapper.git"
   },
   "bugs": {
-    "url": "https://github.com/YOUR_USERNAME/agent-browser-mapper/issues"
+    "url": "https://github.com/YashJain14/agent-browser-mapper/issues"
   },
-  "homepage": "https://github.com/YOUR_USERNAME/agent-browser-mapper",
+  "homepage": "https://github.com/YashJain14/agent-browser-mapper",
   "devDependencies": {}
 }
