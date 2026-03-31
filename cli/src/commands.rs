@@ -1096,6 +1096,52 @@ pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError
             }
         }
 
+        // === Map ===
+        "map" => {
+            const VALID: &[&str] = &["start", "stop", "task"];
+            match rest.first().copied() {
+                Some("start") => {
+                    let mut cmd = json!({ "id": id, "action": "map_start" });
+                    // Optional --site flag for better output
+                    if let Some(idx) = rest.iter().position(|s| *s == "--site") {
+                        if let Some(site) = rest.get(idx + 1) {
+                            cmd["site"] = json!(site);
+                        }
+                    }
+                    Ok(cmd)
+                }
+                Some("stop") => {
+                    let mut cmd = json!({ "id": id, "action": "map_stop" });
+                    if let Some(path) = rest.get(1) {
+                        cmd["path"] = json!(path);
+                    }
+                    Ok(cmd)
+                }
+                Some("task") => {
+                    let mut cmd = json!({ "id": id, "action": "map_task" });
+                    let task_name = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+                        context: "map task".to_string(),
+                        usage: "map task <name>",
+                    })?;
+                    cmd["taskName"] = json!(task_name);
+
+                    // Optional --end flag to mark task as complete
+                    if rest.contains(&"--end") {
+                        cmd["end"] = json!(true);
+                    }
+                    Ok(cmd)
+                }
+                Some(sub) => Err(ParseError::UnknownSubcommand {
+                    subcommand: sub.to_string(),
+                    valid_options: VALID,
+                }),
+                None => Err(ParseError::MissingArguments {
+                    context: "map".to_string(),
+                    usage: "map <start|stop|task> [args]",
+                }),
+            }
+        }
+
         // === Profiler (CDP Tracing / Chromium profiling) ===
         "profiler" => {
             const VALID: &[&str] = &["start", "stop"];

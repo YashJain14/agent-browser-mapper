@@ -1,7 +1,7 @@
 {
-  "name": "agent-browser",
-  "version": "0.23.3",
-  "description": "Browser automation CLI for AI agents",
+  "name": "agent-browser-mapper",
+  "version": "0.24.0",
+  "description": "Browser automation CLI for AI agents with state mapping",
   "type": "module",
   "files": [
     "bin",
@@ -31,16 +31,19 @@
     "chrome",
     "cdp",
     "cli",
-    "agent"
+    "agent",
+    "mapper",
+    "state-graph",
+    "workflow"
   ],
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vercel-labs/agent-browser.git"
+    "url": "git+https://github.com/YOUR_USERNAME/agent-browser-mapper.git"
   },
   "bugs": {
-    "url": "https://github.com/vercel-labs/agent-browser/issues"
+    "url": "https://github.com/YOUR_USERNAME/agent-browser-mapper/issues"
   },
-  "homepage": "https://agent-browser.dev",
+  "homepage": "https://github.com/YOUR_USERNAME/agent-browser-mapper",
   "devDependencies": {}
 }

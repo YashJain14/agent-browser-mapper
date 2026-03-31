@@ -179,6 +179,7 @@ pub struct DaemonState {
     pub session_id: String,
     pub tracing_state: TracingState,
     pub recording_state: RecordingState,
+    pub mapper_state: super::mapper::MapperState,
     event_rx: Option<broadcast::Receiver<CdpEvent>>,
     pub screencasting: bool,
     pub policy: Option<ActionPolicy>,
@@ -242,6 +243,7 @@ impl DaemonState {
             session_id: env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string()),
             tracing_state: TracingState::new(),
             recording_state: RecordingState::new(),
+            mapper_state: super::mapper::MapperState::new(),
             event_rx: None,
             screencasting: false,
             policy: ActionPolicy::load_if_exists(),
@@ -1221,6 +1223,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         }
         "trace_start" => handle_trace_start(state).await,
         "trace_stop" => handle_trace_stop(cmd, state).await,
+        "map_start" => handle_map_start(cmd, state).await,
+        "map_stop" => handle_map_stop(cmd, state).await,
+        "map_task" => handle_map_task(cmd, state).await,
         "profiler_start" => handle_profiler_start(cmd, state).await,
         "profiler_stop" => handle_profiler_stop(cmd, state).await,
         "recording_start" => handle_recording_start(cmd, state).await,
@@ -1330,7 +1335,14 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     };
 
     let mut resp = match result {
-        Ok(data) => success_response(&id, data),
+        Ok(data) => {
+            // Record state transition if mapping is active and action was successful
+            if state.mapper_state.active && should_record_action(action) {
+                let selector = cmd.get("selector").and_then(|v| v.as_str());
+                let _ = record_mapper_state(state, action, selector, None).await;
+            }
+            success_response(&id, data)
+        }
         Err(e) => error_response(&id, &super::browser::to_ai_friendly_error(&e)),
     };
 
@@ -3688,6 +3700,351 @@ async fn handle_profiler_stop(cmd: &Value, state: &mut DaemonState) -> Result<Va
     let session_id = mgr.active_session_id()?.to_string();
     let path = cmd.get("path").and_then(|v| v.as_str());
     native_tracing::profiler_stop(&mgr.client, &session_id, &mut state.tracing_state, path).await
+}
+
+async fn handle_map_start(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    if state.mapper_state.active {
+        return Err("Mapping already active".to_string());
+    }
+
+    // Get site from command or try to extract from current URL
+    let site = if let Some(site_str) = cmd.get("site").and_then(|v| v.as_str()) {
+        site_str.to_string()
+    } else {
+        // Try to get current URL if browser is open
+        if let Some(ref mgr) = state.browser {
+            mgr.get_url()
+                .await
+                .ok()
+                .and_then(|url| url::Url::parse(&url).ok())
+                .and_then(|u| u.host_str().map(String::from))
+                .unwrap_or_else(|| "unknown".to_string())
+        } else {
+            "unknown".to_string()
+        }
+    };
+
+    state.mapper_state.active = true;
+    state.mapper_state.site = site;
+    state.mapper_state.graph = super::mapper::StateGraph::new();
+    state.mapper_state.current_state_id = None;
+    state.mapper_state.task_name = None;
+    state.mapper_state.task_start_node = None;
+    state.mapper_state.tasks = Vec::new();
+
+    Ok(json!({ "started": true, "recording": true }))
+}
+
+async fn handle_map_task(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    if !state.mapper_state.active {
+        return Err("Mapping not active. Run 'map start' first.".to_string());
+    }
+
+    let task_name = cmd
+        .get("taskName")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing task name")?;
+
+    let end_task = cmd.get("end").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if end_task {
+        // End current task
+        let start_node = state.mapper_state.task_start_node.clone();
+        let current_node = state.mapper_state.current_state_id.clone();
+
+        if let (Some(start), Some(current)) = (start_node, current_node) {
+            let task_ref = super::mapper::TaskRef {
+                name: task_name.to_string(),
+                start_node: start.clone(),
+                end_node: current.clone(),
+            };
+            state.mapper_state.tasks.push(task_ref);
+            state.mapper_state.task_name = None;
+            state.mapper_state.task_start_node = None;
+
+            Ok(json!({
+                "task_ended": true,
+                "name": task_name,
+                "start_node": start,
+                "end_node": current
+            }))
+        } else {
+            Err("No task in progress or no states recorded".to_string())
+        }
+    } else {
+        // Start new task
+        state.mapper_state.task_name = Some(task_name.to_string());
+        state.mapper_state.task_start_node = state.mapper_state.current_state_id.clone();
+
+        Ok(json!({
+            "task_started": true,
+            "name": task_name
+        }))
+    }
+}
+
+async fn handle_map_stop(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    if !state.mapper_state.active {
+        return Err("No mapping in progress".to_string());
+    }
+
+    state.mapper_state.active = false;
+
+    // Determine output path
+    let output_path = cmd
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("action-map.json");
+
+    // Save the action map
+    let graph = &state.mapper_state.graph;
+    let tasks = state.mapper_state.tasks.clone();
+    let site = &state.mapper_state.site;
+
+    super::mapper::output::save_action_map(
+        graph,
+        tasks,
+        site,
+        std::path::Path::new(output_path),
+    )?;
+
+    Ok(json!({
+        "saved": true,
+        "path": output_path,
+        "nodes": graph.nodes().len(),
+        "edges": graph.edges().len(),
+        "tasks": state.mapper_state.tasks.len()
+    }))
+}
+
+/// Determine if an action should trigger state recording
+fn should_record_action(action: &str) -> bool {
+    matches!(
+        action,
+        "navigate" | "click" | "fill" | "press" | "select" | "submit" | "back" | "forward" | "reload"
+    )
+}
+
+/// Record current state after a navigation or action completes
+async fn record_mapper_state(
+    state: &mut DaemonState,
+    action_type: &str,
+    selector: Option<&str>,
+    description: Option<&str>,
+) -> Result<(), String> {
+    if !state.mapper_state.active {
+        return Ok(());
+    }
+
+    let mgr = match state.browser.as_ref() {
+        Some(m) => m,
+        None => return Ok(()),
+    };
+
+    let session_id = match mgr.active_session_id() {
+        Ok(id) => id.to_string(),
+        Err(_) => return Ok(()),
+    };
+
+    // Get current page state
+    let url = mgr.get_url().await.unwrap_or_default();
+    let title = mgr.get_title().await.unwrap_or_default();
+
+    // Take a snapshot to get the structural representation
+    let options = snapshot::SnapshotOptions {
+        selector: None,
+        interactive: true,
+        compact: true,
+        depth: None,
+    };
+
+    let mut temp_ref_map = RefMap::new();
+    let snapshot_text = match snapshot::take_snapshot(
+        &mgr.client,
+        &session_id,
+        &options,
+        &mut temp_ref_map,
+        state.active_frame_id.as_deref(),
+        &state.iframe_sessions,
+    )
+    .await
+    {
+        Ok(tree) => tree,
+        Err(_) => return Ok(()),
+    };
+
+    // Get or create state node
+    let new_state_id = state
+        .mapper_state
+        .graph
+        .get_or_insert_node(&url, &snapshot_text, &title);
+
+    // If there was a previous state, record the edge
+    if let Some(ref prev_state_id) = state.mapper_state.current_state_id {
+        if prev_state_id != &new_state_id {
+            let raw_selector = selector.unwrap_or("navigation");
+            let edge_description = description.unwrap_or_else(|| action_type);
+
+            // Extract rich selector info from ref_map if it's a ref
+            let (selector_info, element_info) = if raw_selector.starts_with('@') {
+                extract_selector_info(raw_selector, &state.ref_map, &mgr.client, &session_id).await
+            } else {
+                // For non-ref selectors (CSS, XPath, etc.), create basic info
+                (
+                    super::mapper::types::SelectorInfo {
+                        raw: raw_selector.to_string(),
+                        aria: None,
+                        name: None,
+                        role: None,
+                    },
+                    super::mapper::types::ElementInfo {
+                        tag: None,
+                        class: None,
+                        id: None,
+                    },
+                )
+            };
+
+            state.mapper_state.graph.add_edge(
+                prev_state_id,
+                &new_state_id,
+                selector_info,
+                element_info,
+                action_type,
+                None,
+                edge_description,
+            );
+        }
+    } else if state.mapper_state.task_start_node.is_none() {
+        // First state recorded - set as task start if task is active
+        state.mapper_state.task_start_node = Some(new_state_id.clone());
+    }
+
+    // Update current state
+    state.mapper_state.current_state_id = Some(new_state_id);
+
+    Ok(())
+}
+
+/// Extract rich selector information from a ref
+async fn extract_selector_info(
+    ref_selector: &str,
+    ref_map: &RefMap,
+    client: &super::cdp::client::CdpClient,
+    session_id: &str,
+) -> (
+    super::mapper::types::SelectorInfo,
+    super::mapper::types::ElementInfo,
+) {
+    // Get ref entry from map
+    if let Some(ref_entry) = ref_map.get(ref_selector.trim_start_matches('@')) {
+        // Build ARIA selector
+        let aria_selector = if !ref_entry.name.is_empty() {
+            format!("role={} name=\"{}\"", ref_entry.role, ref_entry.name)
+        } else {
+            format!("role={}", ref_entry.role)
+        };
+
+        let selector_info = super::mapper::types::SelectorInfo {
+            raw: ref_selector.to_string(),
+            aria: Some(aria_selector),
+            name: if !ref_entry.name.is_empty() {
+                Some(ref_entry.name.clone())
+            } else {
+                None
+            },
+            role: Some(ref_entry.role.clone()),
+        };
+
+        // Try to get element details via CDP
+        let element_info = if let Some(backend_node_id) = ref_entry.backend_node_id {
+            get_element_details(client, session_id, backend_node_id).await
+        } else {
+            super::mapper::types::ElementInfo {
+                tag: None,
+                class: None,
+                id: None,
+            }
+        };
+
+        (selector_info, element_info)
+    } else {
+        // Ref not found, return basic info
+        (
+            super::mapper::types::SelectorInfo {
+                raw: ref_selector.to_string(),
+                aria: None,
+                name: None,
+                role: None,
+            },
+            super::mapper::types::ElementInfo {
+                tag: None,
+                class: None,
+                id: None,
+            },
+        )
+    }
+}
+
+/// Get element details (tag, class, id) via CDP
+async fn get_element_details(
+    client: &super::cdp::client::CdpClient,
+    session_id: &str,
+    backend_node_id: i64,
+) -> super::mapper::types::ElementInfo {
+    // Resolve node to get object ID
+    let resolve_result = client
+        .send_command(
+            "DOM.resolveNode",
+            Some(serde_json::json!({ "backendNodeId": backend_node_id })),
+            Some(session_id),
+        )
+        .await;
+
+    if let Ok(result) = resolve_result {
+        if let Some(object_id) = result
+            .get("object")
+            .and_then(|o| o.get("objectId"))
+            .and_then(|id| id.as_str())
+        {
+            // Get element properties
+            let props_result = client
+                .send_command(
+                    "Runtime.callFunctionOn",
+                    Some(serde_json::json!({
+                        "functionDeclaration": "function() { return { tag: this.tagName?.toLowerCase(), class: this.className, id: this.id }; }",
+                        "objectId": object_id,
+                        "returnByValue": true
+                    })),
+                    Some(session_id),
+                )
+                .await;
+
+            if let Ok(props) = props_result {
+                if let Some(value) = props.get("result").and_then(|r| r.get("value")) {
+                    return super::mapper::types::ElementInfo {
+                        tag: value.get("tag").and_then(|v| v.as_str()).map(String::from),
+                        class: value
+                            .get("class")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from),
+                        id: value
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from),
+                    };
+                }
+            }
+        }
+    }
+
+    super::mapper::types::ElementInfo {
+        tag: None,
+        class: None,
+        id: None,
+    }
 }
 
 async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {

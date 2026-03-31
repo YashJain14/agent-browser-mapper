@@ -1,6 +1,6 @@
 [package]
 name = "agent-browser"
-version = "0.23.3"
+version = "0.24.0"
 edition = "2021"
 description = "Fast browser automation CLI for AI agents"
 license = "Apache-2.0"
@@ -28,8 +28,9 @@ aes-gcm = "0.10"
 async-trait = "0.1"
 socket2 = "0.6"
 similar = "2"
-zip = { version = "8.2.0", default-features = false, features = ["deflate"] }
+zip = { version = "8.0.0", default-features = false, features = ["deflate"] }
 time = { version = "0.3", features = ["formatting"] }
+chrono = { version = "0.4.38", features = ["serde"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
